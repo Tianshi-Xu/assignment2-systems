@@ -1,0 +1,11 @@
+vocab_size: 10000
+d_model: 1280
+d_ff: 5120
+rope_theta: 10000
+n_layers: 12
+n_heads: 20
+context_length: 256
+batch_size: 4
+num_samples: 10
+forward_only: false
+log_name: benchmark
