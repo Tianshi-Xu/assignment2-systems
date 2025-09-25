@@ -1,0 +1,1 @@
+uv run cs336_systems/benchmark.py -c configs/benchmark.yml
