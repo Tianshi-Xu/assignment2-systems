@@ -1,9 +1,9 @@
 vocab_size: 10000
-d_model: 1280
-d_ff: 5120
+d_model: 768  # 768 1280 2560
+d_ff: 3072   # 3072 5120 10240
 rope_theta: 10000
-n_layers: 12
-n_heads: 20
+n_layers: 12  # 12 36 48
+n_heads: 12  # 12 20 32
 context_length: 256
 batch_size: 4
 num_samples: 10
