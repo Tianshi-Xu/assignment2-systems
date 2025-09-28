@@ -1,4 +1,8 @@
-from cs336_basics.model import *
+import cs336_basics
+from cs336_systems.nvx_module import annotated_scaled_dot_product_attention
+cs336_basics.model.scaled_dot_product_attention = annotated_scaled_dot_product_attention
+from cs336_basics.model import BasicsTransformerLM
+from cs336_basics.optimizer import AdamW
 import torch
 import argparse
 import logging
@@ -7,7 +11,10 @@ from timm.utils import setup_default_logging
 from logging.handlers import RotatingFileHandler
 import time
 import statistics
+import torch.nn.functional as F
+import torch.cuda.nvtx as nvtx
 from contextlib import nullcontext
+
 
 config_parser = parser = argparse.ArgumentParser(description='Training Config', add_help=False)
 parser.add_argument('-c', '--config', default='', type=str, metavar='FILE',
@@ -16,6 +23,7 @@ parser.add_argument('-c', '--config', default='', type=str, metavar='FILE',
 parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
 
 ### model
+parser.add_argument('--model_size', type=str, default='small', choices=['small', 'large', 'huge'], help="model name")
 parser.add_argument('--vocab_size', type=int, default=10000, help="vocabulary size")
 parser.add_argument('--d_model', type=int, default=512, help="model dimension")
 parser.add_argument('--d_ff', type=int, default=1344, help="feed forward dimension")
@@ -67,22 +75,31 @@ def main():
         d_ff=args.d_ff,
         rope_theta=args.rope_theta,
     )
+
+    random_input = torch.randint(0, args.vocab_size, (args.num_samples, args.batch_size, args.context_length))
+    random_label = torch.randint(0, args.vocab_size, (args.num_samples, args.batch_size, args.context_length))
+    random_input = random_input.cuda()
+    random_label = random_label.cuda()
+    model = model.cuda()
+    optimizer = AdamW(model.parameters(), lr=1e-3)
     if args.mixed_precision:
         ctx_manager = torch.autocast(device_type='cuda', dtype=torch.bfloat16)
     else:
-        # 如果不用混合精度，就用这个“什么都不做”的上下文管理器
         ctx_manager = nullcontext()
-    random_input = torch.randint(0, args.vocab_size, (args.num_samples, args.batch_size, args.context_length))
-    random_input = random_input.cuda()
-    model = model.cuda()
     ### warmup for 5 samples
-    for i in range(5):
-        if args.forward_only:
-            with torch.no_grad():
-                output = model(random_input[i])
-        else:
-            output = model(random_input[i])
-            output.sum().backward()
+    with ctx_manager:
+        with nvtx.range("warm up"):
+            for i in range(5):
+                if args.forward_only:
+                    with torch.no_grad():
+                        output = model(random_input[i])
+                else:
+                    output = model(random_input[i])
+                    loss = F.cross_entropy(output.view(-1, args.vocab_size), random_label[i].view(-1))
+                    loss.backward()
+                    optimizer.step()
+                    optimizer.zero_grad()
+    print("warmup done")
     forward_times = []
     backward_times = []
     with ctx_manager:
@@ -95,12 +112,19 @@ def main():
                 forward_times.append(time.perf_counter() - time_start)
             else:
                 time_forward_start = time.perf_counter()
-                output = model(random_input[i])
-                torch.cuda.synchronize()
-                forward_times.append(time.perf_counter() - time_forward_start)
-                time_backward_start = time.perf_counter()
-                output.sum().backward()
-                torch.cuda.synchronize()
+                with nvtx.range("forward"):
+                    output = model(random_input[i])
+                    torch.cuda.synchronize()
+                    forward_times.append(time.perf_counter() - time_forward_start)
+                    time_backward_start = time.perf_counter()
+                with nvtx.range("backward"):
+                    loss = F.cross_entropy(output.view(-1, args.vocab_size), random_label[i].view(-1))
+                    loss.backward()
+                    torch.cuda.synchronize()
+                with nvtx.range("optimizer"):
+                    optimizer.step()
+                    optimizer.zero_grad()
+                    torch.cuda.synchronize()
                 backward_times.append(time.perf_counter() - time_backward_start)
     print(forward_times)
     print(backward_times)
