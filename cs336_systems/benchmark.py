@@ -68,13 +68,13 @@ def main():
     random_input = random_input.cuda()
     model = model.cuda()
     ### warmup for 5 samples
-    # for i in range(5):
-    #     if args.forward_only:
-    #         with torch.no_grad():
-    #             output = model(random_input[i])
-    #     else:
-    #         output = model(random_input[i])
-    #         output.sum().backward()
+    for i in range(5):
+        if args.forward_only:
+            with torch.no_grad():
+                output = model(random_input[i])
+        else:
+            output = model(random_input[i])
+            output.sum().backward()
     forward_times = []
     backward_times = []
     for i in range(args.num_samples):
