@@ -13,7 +13,7 @@ import time
 import statistics
 import torch.nn.functional as F
 import torch.cuda.nvtx as nvtx
-
+from contextlib import nullcontext
 
 
 config_parser = parser = argparse.ArgumentParser(description='Training Config', add_help=False)
@@ -23,6 +23,7 @@ parser.add_argument('-c', '--config', default='', type=str, metavar='FILE',
 parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
 
 ### model
+parser.add_argument('--model_size', type=str, default='small', choices=['small', 'large', 'huge'], help="model name")
 parser.add_argument('--vocab_size', type=int, default=10000, help="vocabulary size")
 parser.add_argument('--d_model', type=int, default=512, help="model dimension")
 parser.add_argument('--d_ff', type=int, default=1344, help="feed forward dimension")
@@ -35,6 +36,9 @@ parser.add_argument('--forward_only', action='store_true', help='only benchmark 
 parser.add_argument('--context_length', type=int, default=256, help="context length")
 parser.add_argument('--batch_size', type=int, default=4, help="batch size")
 parser.add_argument('--num_samples', type=int, default=10, help="number of samples to generate")
+
+### mixedprecision
+parser.add_argument('--mixed_precision', action='store_true', help='use mixed precision')
 
 _logger = logging.getLogger('train')
 
@@ -78,44 +82,50 @@ def main():
     random_label = random_label.cuda()
     model = model.cuda()
     optimizer = AdamW(model.parameters(), lr=1e-3)
+    if args.mixed_precision:
+        ctx_manager = torch.autocast(device_type='cuda', dtype=torch.bfloat16)
+    else:
+        ctx_manager = nullcontext()
     ### warmup for 5 samples
-    with nvtx.range("warm up"):
-        for i in range(5):
-            if args.forward_only:
-                with torch.no_grad():
+    with ctx_manager:
+        with nvtx.range("warm up"):
+            for i in range(5):
+                if args.forward_only:
+                    with torch.no_grad():
+                        output = model(random_input[i])
+                else:
                     output = model(random_input[i])
-            else:
-                output = model(random_input[i])
-                loss = F.cross_entropy(output.view(-1, args.vocab_size), random_label[i].view(-1))
-                loss.backward()
-                optimizer.step()
-                optimizer.zero_grad()
+                    loss = F.cross_entropy(output.view(-1, args.vocab_size), random_label[i].view(-1))
+                    loss.backward()
+                    optimizer.step()
+                    optimizer.zero_grad()
     print("warmup done")
     forward_times = []
     backward_times = []
-    for i in range(args.num_samples):
-        if args.forward_only:
-            time_start = time.perf_counter()
-            with torch.no_grad():
-                output = model(random_input[i])
-            torch.cuda.synchronize()
-            forward_times.append(time.perf_counter() - time_start)
-        else:
-            time_forward_start = time.perf_counter()
-            with nvtx.range("forward"):
-                output = model(random_input[i])
+    with ctx_manager:
+        for i in range(args.num_samples):
+            if args.forward_only:
+                time_start = time.perf_counter()
+                with torch.no_grad():
+                    output = model(random_input[i])
                 torch.cuda.synchronize()
-                forward_times.append(time.perf_counter() - time_forward_start)
-                time_backward_start = time.perf_counter()
-            with nvtx.range("backward"):
-                loss = F.cross_entropy(output.view(-1, args.vocab_size), random_label[i].view(-1))
-                loss.backward()
-                torch.cuda.synchronize()
-            with nvtx.range("optimizer"):
-                optimizer.step()
-                optimizer.zero_grad()
-                torch.cuda.synchronize()
-            backward_times.append(time.perf_counter() - time_backward_start)
+                forward_times.append(time.perf_counter() - time_start)
+            else:
+                time_forward_start = time.perf_counter()
+                with nvtx.range("forward"):
+                    output = model(random_input[i])
+                    torch.cuda.synchronize()
+                    forward_times.append(time.perf_counter() - time_forward_start)
+                    time_backward_start = time.perf_counter()
+                with nvtx.range("backward"):
+                    loss = F.cross_entropy(output.view(-1, args.vocab_size), random_label[i].view(-1))
+                    loss.backward()
+                    torch.cuda.synchronize()
+                with nvtx.range("optimizer"):
+                    optimizer.step()
+                    optimizer.zero_grad()
+                    torch.cuda.synchronize()
+                backward_times.append(time.perf_counter() - time_backward_start)
     print(forward_times)
     print(backward_times)
     if args.forward_only:

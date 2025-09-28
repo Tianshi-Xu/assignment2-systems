@@ -8,4 +8,5 @@ context_length: 256
 batch_size: 4
 num_samples: 10
 forward_only: false
+mixed_precision: true
 log_name: benchmark

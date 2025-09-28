@@ -7,6 +7,7 @@ from timm.utils import setup_default_logging
 from logging.handlers import RotatingFileHandler
 import time
 import statistics
+from contextlib import nullcontext
 
 config_parser = parser = argparse.ArgumentParser(description='Training Config', add_help=False)
 parser.add_argument('-c', '--config', default='', type=str, metavar='FILE',
@@ -66,7 +67,7 @@ def main():
         d_ff=args.d_ff,
         rope_theta=args.rope_theta,
     )
-    if use_mixed_precision:
+    if args.mixed_precision:
         ctx_manager = torch.autocast(device_type='cuda', dtype=torch.bfloat16)
     else:
         # 如果不用混合精度，就用这个“什么都不做”的上下文管理器
@@ -75,31 +76,33 @@ def main():
     random_input = random_input.cuda()
     model = model.cuda()
     ### warmup for 5 samples
-    for i in range(5):
-        if args.forward_only:
-            with torch.no_grad():
+    with ctx_manager:
+        for i in range(5):
+            if args.forward_only:
+                with torch.no_grad():
+                    output = model(random_input[i])
+            else:
                 output = model(random_input[i])
-        else:
-            output = model(random_input[i])
-            output.sum().backward()
+                output.sum().backward()
     forward_times = []
     backward_times = []
-    for i in range(args.num_samples):
-        if args.forward_only:
-            time_start = time.perf_counter()
-            with torch.no_grad():
+    with ctx_manager:
+        for i in range(args.num_samples):
+            if args.forward_only:
+                time_start = time.perf_counter()
+                with torch.no_grad():
+                    output = model(random_input[i])
+                torch.cuda.synchronize()
+                forward_times.append(time.perf_counter() - time_start)
+            else:
+                time_forward_start = time.perf_counter()
                 output = model(random_input[i])
-            torch.cuda.synchronize()
-            forward_times.append(time.perf_counter() - time_start)
-        else:
-            time_forward_start = time.perf_counter()
-            output = model(random_input[i])
-            torch.cuda.synchronize()
-            forward_times.append(time.perf_counter() - time_forward_start)
-            time_backward_start = time.perf_counter()
-            output.sum().backward()
-            torch.cuda.synchronize()
-            backward_times.append(time.perf_counter() - time_backward_start)
+                torch.cuda.synchronize()
+                forward_times.append(time.perf_counter() - time_forward_start)
+                time_backward_start = time.perf_counter()
+                output.sum().backward()
+                torch.cuda.synchronize()
+                backward_times.append(time.perf_counter() - time_backward_start)
     print(forward_times)
     print(backward_times)
     if args.forward_only:
