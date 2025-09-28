@@ -28,6 +28,9 @@ parser.add_argument('--context_length', type=int, default=256, help="context len
 parser.add_argument('--batch_size', type=int, default=4, help="batch size")
 parser.add_argument('--num_samples', type=int, default=10, help="number of samples to generate")
 
+### mixedprecision
+parser.add_argument('--mixed_precision', action='store_true', help='use mixed precision')
+
 _logger = logging.getLogger('train')
 
 def _parse_args():
@@ -63,18 +66,22 @@ def main():
         d_ff=args.d_ff,
         rope_theta=args.rope_theta,
     )
-
+    if use_mixed_precision:
+        ctx_manager = torch.autocast(device_type='cuda', dtype=torch.bfloat16)
+    else:
+        # 如果不用混合精度，就用这个“什么都不做”的上下文管理器
+        ctx_manager = nullcontext()
     random_input = torch.randint(0, args.vocab_size, (args.num_samples, args.batch_size, args.context_length))
     random_input = random_input.cuda()
     model = model.cuda()
     ### warmup for 5 samples
-    # for i in range(5):
-    #     if args.forward_only:
-    #         with torch.no_grad():
-    #             output = model(random_input[i])
-    #     else:
-    #         output = model(random_input[i])
-    #         output.sum().backward()
+    for i in range(5):
+        if args.forward_only:
+            with torch.no_grad():
+                output = model(random_input[i])
+        else:
+            output = model(random_input[i])
+            output.sum().backward()
     forward_times = []
     backward_times = []
     for i in range(args.num_samples):
