@@ -36,6 +36,7 @@ parser.add_argument('--num_samples', type=int, default=10, help="number of sampl
 
 ### mixedprecision
 parser.add_argument('--mixed_precision', action='store_true', help='use mixed precision')
+parser.add_argument('--use_jit', action='store_true', help='use jit')
 
 _logger = logging.getLogger('train')
 
@@ -68,6 +69,8 @@ def main():
         num_heads=args.n_heads,
         positional_encoder=RotaryEmbedding(args.context_length, args.d_model, args.rope_theta),
     )
+    if args.use_jit:
+        att = torch.compile(att)
     _logger.info(f"att: {att}")
     random_input = torch.randn(args.num_samples, args.batch_size, args.context_length, args.d_model)
     random_input = random_input.cuda()
@@ -118,7 +121,10 @@ def main():
                     optimizer.zero_grad()
                     torch.cuda.synchronize()
                 backward_times.append(time.perf_counter() - time_backward_start)
-    torch.cuda.memory._dump_snapshot(f"memory_snapshot_forward_{args.d_model}_{args.context_length}.pickle")
+    if args.use_jit:
+        torch.cuda.memory._dump_snapshot(f"memory_snapshot_{args.d_model}_{args.context_length}_jit.pickle")
+    else:
+        torch.cuda.memory._dump_snapshot(f"memory_snapshot_{args.d_model}_{args.context_length}.pickle")
     torch.cuda.memory._record_memory_history(enabled=None)
     # print(forward_times)
     # print(backward_times)

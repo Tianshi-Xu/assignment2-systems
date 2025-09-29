@@ -1,0 +1,1 @@
+CUDA_VISIBLE_DEVICES=0 uv run python cs336_systems/nsp.py -c configs/nsp.yml

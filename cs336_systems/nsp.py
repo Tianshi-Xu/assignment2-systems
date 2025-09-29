@@ -39,6 +39,7 @@ parser.add_argument('--num_samples', type=int, default=10, help="number of sampl
 
 ### mixedprecision
 parser.add_argument('--mixed_precision', action='store_true', help='use mixed precision')
+parser.add_argument('--use_jit', action='store_true', help='use jit')
 
 _logger = logging.getLogger('train')
 
@@ -75,7 +76,9 @@ def main():
         d_ff=args.d_ff,
         rope_theta=args.rope_theta,
     )
-
+    if args.use_jit:
+        _logger.info("using jit")
+        model = torch.compile(model)
     random_input = torch.randint(0, args.vocab_size, (args.num_samples, args.batch_size, args.context_length))
     random_label = torch.randint(0, args.vocab_size, (args.num_samples, args.batch_size, args.context_length))
     random_input = random_input.cuda()
@@ -102,16 +105,19 @@ def main():
     print("warmup done")
     forward_times = []
     backward_times = []
-    with ctx_manager:
-        for i in range(args.num_samples):
-            if args.forward_only:
-                time_start = time.perf_counter()
-                with torch.no_grad():
+    torch.cuda.memory._record_memory_history(max_entries=1000000)
+    for i in range(args.num_samples):
+        if args.forward_only:
+            time_start = time.perf_counter()
+            with torch.no_grad():
+                with ctx_manager:
                     output = model(random_input[i])
-                torch.cuda.synchronize()
-                forward_times.append(time.perf_counter() - time_start)
-            else:
-                time_forward_start = time.perf_counter()
+                    del output
+            torch.cuda.synchronize()
+            forward_times.append(time.perf_counter() - time_start)
+        else:
+            time_forward_start = time.perf_counter()
+            with ctx_manager:
                 with nvtx.range("forward"):
                     output = model(random_input[i])
                     torch.cuda.synchronize()
@@ -125,7 +131,13 @@ def main():
                     optimizer.step()
                     optimizer.zero_grad()
                     torch.cuda.synchronize()
-                backward_times.append(time.perf_counter() - time_backward_start)
+            backward_times.append(time.perf_counter() - time_backward_start)
+
+    if args.use_jit:
+        torch.cuda.memory._dump_snapshot(f"memory_snapshot_{args.context_length}_jit.pickle")
+    else:
+        torch.cuda.memory._dump_snapshot(f"memory_snapshot_{args.context_length}.pickle")
+    torch.cuda.memory._record_memory_history(enabled=None)
     print(forward_times)
     print(backward_times)
     if args.forward_only:
