@@ -1,0 +1,1 @@
+CUDA_VISIBLE_DEVICES=0 uv run nsys profile --force-overwrite true --python-backtrace=cuda -o result_small python cs336_systems/flash_att.py -c configs/att.yml
