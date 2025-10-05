@@ -6,7 +6,9 @@ from .adapters import (
     get_flashattention_autograd_function_pytorch,
     get_flashattention_autograd_function_triton,
 )
+from cs336_systems.flash_att import FlashAttentionTorch
 
+torch.set_float32_matmul_precision('high')
 
 def _attention_and_lse(q, k, v, is_causal=False):
     n_queries = q.shape[-2]
@@ -42,6 +44,8 @@ def _make_attn_inputs(device=None):
 
 def _test_flash_forward_pass(impl, device="cpu", is_causal=False):
     q, k, v, _do = _make_attn_inputs(device)
+    # print("q.dtype, k.dtype, v.dtype", q.dtype, k.dtype, v.dtype)
+    # print("q.shape, k.shape, v.shape", q.shape, k.shape, v.shape)
     o = impl(q, k, v, is_causal)
 
     # Extract L from the saved tensors
@@ -52,7 +56,6 @@ def _test_flash_forward_pass(impl, device="cpu", is_causal=False):
     l = maybe_ls[0]
 
     o_ref, l_ref = _attention_and_lse(q, k, v, is_causal)
-
     torch.testing.assert_close(o, o_ref, rtol=1e-2, atol=1e-2)
     torch.testing.assert_close(l, l_ref, rtol=1e-2, atol=1e-2)
 
