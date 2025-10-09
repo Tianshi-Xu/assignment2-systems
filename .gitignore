@@ -6,6 +6,10 @@ test_results.xml
 __pycache__/
 *.py[cod]
 *$py.class
+*.nsys-rep
+*.pt
+data
+*.npy
 
 # C extensions
 *.so
