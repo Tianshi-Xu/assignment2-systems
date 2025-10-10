@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.distributed as dist
+import torch
 import os
 import torch.multiprocessing as mp
 from utils import *
@@ -73,8 +74,8 @@ def train_worker(rank, world_size, train_loader, vaild_loader, epoch, batch_size
                 all_reduce_time_start = time.perf_counter()
                 for param in model.parameters():
                     dist.all_reduce(param.grad.data, op=dist.ReduceOp.AVG,async_op=False)
-                dist.barrier()
-                torch.cuda.synchronize()
+                # dist.barrier()
+                # torch.cuda.synchronize()
             if rank == 0 and j > 5:
                 print(f"all reduce time: {time.perf_counter()-all_reduce_time_start}")
             with nvtx.range("optimizer"):
@@ -85,6 +86,7 @@ def train_worker(rank, world_size, train_loader, vaild_loader, epoch, batch_size
                 torch.cuda.synchronize()
             if rank == 0 and j > 5:
                 print(f"total time: {time.perf_counter()-total_time_start}")
+    test_param = next(model.parameters())
     dist.destroy_process_group()
 
 def train_worker_fast(rank, world_size, train_loader, vaild_loader, epoch, batch_size):
@@ -99,7 +101,7 @@ def train_worker_fast(rank, world_size, train_loader, vaild_loader, epoch, batch
         num_heads=25,
         d_ff=6400,
         rope_theta=10000,
-    ).to(device)
+    ).to(torch.bfloat16).to(device)
     # model = DDP(model)
     model = DDP_bucketed(model, 1)
     # model = torch_DDP(model, device_ids=[rank+2])
@@ -137,16 +139,19 @@ def train_worker_fast(rank, world_size, train_loader, vaild_loader, epoch, batch
                 torch.cuda.synchronize()
             if rank == 0 and j > 5:
                 print(f"total time: {time.perf_counter()-total_time_start}")
+    test_param = next(model.parameters())
+    print("check param equal:", torch.mean(test_param))
+    stdout.flush()
     dist.destroy_process_group()
    
  
 def main():
     world_size = 2
     epoch = 1
-    batch_size = 28
+    batch_size = 32
     train_dir = "data/TinyStories_train_tokens.npy"
     valid_dir = "data/TinyStories_valid_tokens.npy"
-    context_length = 256
+    context_length = 128
     train_dataset = LMDataset(train_dir, context_length)
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     valid_dataset = LMDataset(valid_dir,context_length)

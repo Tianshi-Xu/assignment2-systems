@@ -69,6 +69,7 @@ class DDP_bucketed(torch.nn.Module):
         self.buckets = []
         bucket = {"param":[], "total":0, "ready":0}
         bytes_per_param = next(module.parameters()).dtype.itemsize
+        print("bytes_per_param", bytes_per_param)
         def hook(param: torch.Tensor):
             # print("param._bucket_idx:", param._bucket_idx)
             # print("len(self.buckets)", len(self.buckets))

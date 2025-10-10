@@ -1,1 +1,1 @@
-CUDA_VISIBLE_DEVICES=0 uv run nsys profile --force-overwrite true --python-backtrace=cuda -o result_small python cs336_systems/nsp.py -c configs/nsp.yml
+uv run nsys profile --force-overwrite true --python-backtrace=cuda -o result_1 python cs336_systems/ddp.py
