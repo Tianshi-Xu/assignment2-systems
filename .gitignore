@@ -10,6 +10,7 @@ __pycache__/
 *.pt
 data
 *.npy
+.venv
 
 # C extensions
 *.so

@@ -4,6 +4,8 @@ import numpy as np
 import torch.distributed as dist
 import math
 from sys import stdout
+from torch.optim import Optimizer, AdamW
+from typing import Type,Any
 
 class LMDataset(Dataset):
     def __init__(self, dataset_path: str, context_length: int,
@@ -117,3 +119,38 @@ class DDP_bucketed(torch.nn.Module):
             bucket["flat"] = None
             bucket["grads"] = None
         # self.buckets.clear()
+        
+        
+class FSDP_Optimizer(torch.optim.Optimizer):
+    def __init__(self, params, optimizer_cls: Type[Optimizer], **kwargs: Any):
+        self.params = list(params)
+        if dist.is_initialized():
+            self.world_size = dist.get_world_size()
+        else:
+            self.world_size = 1 
+        self.local_params = []
+        self.rank = dist.get_rank()
+        for param in self.params:
+            print(param.shape)
+            rows_per_rank = param.numel() // self.world_size
+            flat_param = param.view(-1)
+            self.local_params.append(flat_param[rows_per_rank*self.rank:rows_per_rank*(self.rank+1)].clone().detach().requires_grad_())
+            print("self.local_params[-1]:", self.local_params[-1].shape)
+        self.base_optimizer = optimizer_cls(self.local_params, **kwargs)
+        super().__init__(self.local_params, self.base_optimizer.defaults)
+    
+    def step(self, closure = None, **kwargs):
+        self.base_optimizer.step(closure=closure, **kwargs)
+        for param,local_param in zip(self.params,self.local_params):
+            print("rank: local_param",self.rank, local_param)
+            flatten_data = torch.empty((param.data.numel()), device=local_param.device)
+            dist.all_gather_into_tensor(flatten_data, local_param.data, async_op=False)
+            print("rank: flatten_data",self.rank, flatten_data)
+            param.data = flatten_data.view(param.data.shape)
+        
+    def add_param_group(self, param_group: dict[str, Any]):
+        for group in param_group["params"]:
+            param = group
+            rows_per_rank = param.numel() // self.world_size
+            flat_param = param.view(-1)
+            self.local_params.append(flat_param[rows_per_rank*self.rank:rows_per_rank*(self.rank+1)].clone().detach().requires_grad_())
