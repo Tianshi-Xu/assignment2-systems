@@ -123,12 +123,14 @@ class DDP_bucketed(torch.nn.Module):
         
 class FSDP_Optimizer(torch.optim.Optimizer):
     def __init__(self, params, optimizer_cls: Type[Optimizer], **kwargs: Any):
+        params = list(params)
         self.base_optimizer = optimizer_cls(params, **kwargs)
         if dist.is_initialized():
             self.world_size = dist.get_world_size()
+            self.rank = dist.get_rank()
         else:
             self.world_size = 1 
-        self.rank = dist.get_rank()
+            self.rank = 0
         self.meta_infos = []
         self.flat_param_groups = []
         self.param_groups = []
@@ -153,36 +155,55 @@ class FSDP_Optimizer(torch.optim.Optimizer):
             param_group["params"] = [flatten_param_group[num_per_gpu*self.rank:num_per_gpu*(self.rank+1)].clone().detach().requires_grad_()]
             
         
-        super().__init__(self.local_params, self.base_optimizer.defaults)
+        super().__init__(params, self.base_optimizer.defaults)
     
     def update_parameter(self, group_idx):
-        updated_params = torch._utils._unflatten_dense_tensors(self.flat_param_group[group_idx], self.meta_infos[group_idx])
+        updated_params = torch._utils._unflatten_dense_tensors(self.flat_param_groups[group_idx], self.meta_infos[group_idx])
         for p, q in zip(self.param_groups[group_idx], updated_params):
             p.data = q.data
         
     def step(self, closure = None, **kwargs):
-        ## Step1: copy gradient
-        for i, param_group_in_optimizer in enumerate(self.base_optimizer.param_groups):
-            for param, param_in_optimizer in zip(self.param_groups["params"], param_group_in_optimizer["params"]):
-                param_in_optimizer.grad.data = param.grad.data
+        ## Step1: copy gradient from model.param.grad to base_optimizer.param.grad
+        for i, param_group in enumerate(self.param_groups):
+            grads = []
+            for param in param_group:
+                if param.requires_grad:
+                    grads.append(param.grad)
+            flatten_grads = torch._utils._flatten_dense_tensors(grads)
+            num_per_gpu = flatten_grads.numel() // self.world_size
+            self.base_optimizer.param_groups[i]["params"][0].grad = flatten_grads[num_per_gpu*self.rank:num_per_gpu*(self.rank+1)].clone()
         ## Step2: Update
         self.base_optimizer.step()
-        ## All Gather Parameters
+        ## All Gather Parameters and copy param from optimizer to model
         for i, param_group in enumerate(self.param_groups):
             flatten_param_group = self.flat_param_groups[i]
-            meta_info = self.meta_infos[i]
-            dist.all_gather
+            dist.all_gather_into_tensor(flatten_param_group.data, self.base_optimizer.param_groups[i]["params"][0].data, async_op=False)
+            self.update_parameter(i)
                 
     def zero_grad(self, set_to_none=True):
         for i, param_group in enumerate(self.param_groups):
-            for param in param_group["params"]:
+            for param in param_group:
                 param.grad = None
                 param.grad_accum = None
         self.base_optimizer.zero_grad()
         
     def add_param_group(self, param_group: dict[str, Any]):
-        for group in param_group["params"]:
-            param = group
-            rows_per_rank = param.numel() // self.world_size
-            flat_param = param.view(-1)
-            self.local_params.append(flat_param[rows_per_rank*self.rank:rows_per_rank*(self.rank+1)].clone().detach().requires_grad_())
+        self.base_optimizer.add_param_group(param_group)
+        trainable_parameters = []
+        for param in param_group["params"]:
+            if param.requires_grad:
+                param.grad_accum = None
+                trainable_parameters.append(param)
+        self.param_groups.append(trainable_parameters)
+        
+        meta_info = [torch.zeros_like(param.data,device="meta") for param in trainable_parameters]
+        self.meta_infos.append(meta_info)
+        
+        flatten_param_group = torch._utils._flatten_dense_tensors(trainable_parameters)
+        self.flat_param_groups.append(flatten_param_group)
+        for param in trainable_parameters:
+            param.data = torch.empty(1,device=param.device)
+        self.update_parameter(group_idx=len(self.param_groups)-1)
+        ## update param_group["params"] using sharding one
+        num_per_gpu = flatten_param_group.numel() // self.world_size
+        self.base_optimizer.param_groups[-1]["params"] = [flatten_param_group[num_per_gpu*self.rank:num_per_gpu*(self.rank+1)].clone().detach().requires_grad_()]
