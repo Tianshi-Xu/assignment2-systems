@@ -2,7 +2,7 @@
 import torch
 import torch.nn as nn
 from cs336_basics.optimizer import AdamW
-from utils import FSDP_Optimizer
+from .utils import FSDP_Optimizer
 
 class toy_network(nn.Module):
     def __init__(self,**kwargs) -> None:

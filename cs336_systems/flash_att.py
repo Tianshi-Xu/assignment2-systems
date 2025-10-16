@@ -93,7 +93,21 @@ def scaled_dot_product_attention(
     return einsum(attention_weights, V, "... query key, ... key d_v ->  ... query d_v")
 
 
-### grid should be (T_q,, batch_size)
+@triton.autotune(
+    configs=[
+        triton.Config({'Q_TILE_SIZE': 16, 'K_TILE_SIZE': 16}, num_warps=4),
+        # triton.Config({'Q_TILE_SIZE': 32, 'K_TILE_SIZE': 32}, num_warps=4),
+        # triton.Config({'Q_TILE_SIZE': 64, 'K_TILE_SIZE': 64}, num_warps=4),
+        # triton.Config({'Q_TILE_SIZE': 128, 'K_TILE_SIZE': 128}, num_warps=4),
+        # triton.Config({'Q_TILE_SIZE': 16, 'K_TILE_SIZE': 16}, num_warps=8),
+        # triton.Config({'Q_TILE_SIZE': 32, 'K_TILE_SIZE': 32}, num_warps=8),
+        # triton.Config({'Q_TILE_SIZE': 64, 'K_TILE_SIZE': 64}, num_warps=8),
+        # triton.Config({'Q_TILE_SIZE': 128, 'K_TILE_SIZE': 128}, num_warps=8),
+    ],
+    key=['D', 'N_QUERIES', 'N_KEYS'],   # 🔑 关键参数
+)
+
+### grid should be (T_q,, batch_size), use autotune
 @triton.jit
 def flash_fwd_kernel(
     Q_ptr, K_ptr, V_ptr,
@@ -356,13 +370,14 @@ def flash_bwd_kernel_super_fast(
 class FlashAttentionTriton(torch.autograd.Function):
     @staticmethod
     def forward(ctx, Q, K, V, is_causal=False):
-        B_q = 16
-        B_k = 16
+        grid = lambda meta: (
+            triton.cdiv(sqlen, meta['Q_TILE_SIZE']),
+            batch,
+        )
         batch, sqlen, d = Q.shape
-        T_q = sqlen // B_q
         O = torch.empty_like(Q, device=Q.device)
         L = torch.empty((batch, sqlen), device=Q.device)
-        flash_fwd_kernel[(T_q, batch)](
+        flash_fwd_kernel[grid](
             Q, K, V,
             O, L,
             Q.stride(0), Q.stride(1), Q.stride(2),
@@ -373,9 +388,8 @@ class FlashAttentionTriton(torch.autograd.Function):
             N_QUERIES=sqlen, N_KEYS=K.shape[1],
             scale=1/math.sqrt(d),
             D=d,
-            Q_TILE_SIZE=B_q,
-            K_TILE_SIZE=B_k,
             is_causal=is_causal,
+            ### autotune, Q_TILE_SIZE and K_TILE_SIZE will be replaced by the best config
         )
         ctx.save_for_backward(Q, K, V, L, O)
         ctx.is_causal = is_causal
@@ -467,47 +481,46 @@ def test_triton():
 
 def benchmark_flash_att():
     torch.set_float32_matmul_precision('high')
-    sqlens = [128,256,512,1024,2048,4096,8192,16384,32768,65536]
-    head_dims = [16,32,64,128]
-    # sqlens = [65536]
-    # head_dims = [128]
-    choices = ["forward","backward","end2end"]
-    # choices = ["end2end"]
+    # sqlens = [128,256,512,1024,2048,4096,8192,16384,32768,65536]
+    # head_dims = [16,32,64,128]
+    sqlens = [65536]
+    head_dims = [128]
+    # choices = ["forward","backward","end2end"]
+    choices = ["forward"]
     triton_func = FlashAttentionTriton.apply
     samples = 10
     warmup_steps = 3
     ## warmup
-    for i in range(warmup_steps):
-        Q  = torch.randn(1,16384,64,requires_grad=True).cuda()
-        K  = torch.randn(1,16384,64,requires_grad=True).cuda()
-        V  = torch.randn(1,16384,64,requires_grad=True).cuda()
-        Y1 = scaled_dot_product_attention(Q,K,V,True)
-        Y2 = triton_func(Q,K,V,True)
-        Y1.sum().backward()
-        Y2.sum().backward()
-    torch.cuda.synchronize()
     for choice in choices:
         for sqlen in sqlens:
             for head_dim in head_dims:
                 Q  = torch.randn(1,sqlen,head_dim,requires_grad=True).cuda()
                 K  = torch.randn(1,sqlen,head_dim,requires_grad=True).cuda()
                 V  = torch.randn(1,sqlen,head_dim,requires_grad=True).cuda()
+                for i in range(warmup_steps):
+                    Y2 = triton_func(Q,K,V,True)
+                    Y2.sum().backward()
+                for i in range(warmup_steps):
+                    Y1 = scaled_dot_product_attention(Q,K,V,True)
+                    Y1.sum().backward()
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+                print("end warmup")
                 if choice == "forward":
                     time_fwd_start = time.perf_counter()
                     try:
                         for i in range(samples):
                             Y1 = scaled_dot_product_attention(Q,K,V,True)
-                            del Y1
-                        torch.cuda.synchronize()
                         torch_total_time = (time.perf_counter()-time_fwd_start)/samples
                     except Exception as e:
                         torch_total_time = -1
-                        torch.cuda.synchronize()
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+                    print("end forward pytorch")
                     time_fwd_start = time.perf_counter()
                     try:
                         for i in range(samples):
                             Y2 = triton_func(Q,K,V,True)
-                            del Y2
                         torch.cuda.synchronize()
                         triton_total_time = (time.perf_counter()-time_fwd_start)/samples
                     except Exception as e:
@@ -574,4 +587,7 @@ def benchmark_flash_att():
                 stdout.flush()
 
 if __name__ == "__main__":
-    test_triton()
+    # test_triton()
+    benchmark_flash_att()
+    best_config = flash_fwd_kernel.best_config
+    print(best_config)
