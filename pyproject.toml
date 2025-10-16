@@ -21,6 +21,8 @@ dependencies = [
     "einops>=0.8.1",
     "einx>=0.3.0",
     "jaxtyping>=0.3.2",
+    "torch-tb-profiler>=0.4.3",
+    "tensorboard==2.20.0",
 ]
 
 [build-system]

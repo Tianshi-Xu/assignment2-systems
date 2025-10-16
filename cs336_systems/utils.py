@@ -7,6 +7,7 @@ from sys import stdout
 from torch.optim import Optimizer, AdamW
 from typing import Type,Any
 
+
 class LMDataset(Dataset):
     def __init__(self, dataset_path: str, context_length: int,
                  input_path: str = 'input.dat', output_path: str = 'output.dat'):
@@ -124,7 +125,8 @@ class DDP_bucketed(torch.nn.Module):
 class FSDP_Optimizer(torch.optim.Optimizer):
     def __init__(self, params, optimizer_cls: Type[Optimizer], **kwargs: Any):
         params = list(params)
-        self.base_optimizer = optimizer_cls(params, **kwargs)
+        self.base_optimizer = optimizer_cls(params[:1], **kwargs)
+        self.base_optimizer.param_groups.clear()
         if dist.is_initialized():
             self.world_size = dist.get_world_size()
             self.rank = dist.get_rank()
@@ -134,27 +136,7 @@ class FSDP_Optimizer(torch.optim.Optimizer):
         self.meta_infos = []
         self.flat_param_groups = []
         self.param_groups = []
-        for i, param_group in enumerate(self.base_optimizer.param_groups):
-            trainable_parameters = []
-            for param in param_group["params"]:
-                if param.requires_grad:
-                    param.grad_accum = None
-                    trainable_parameters.append(param)
-            self.param_groups.append(trainable_parameters)
-            
-            meta_info = [torch.zeros_like(param.data,device="meta") for param in trainable_parameters]
-            self.meta_infos.append(meta_info)
-            
-            flatten_param_group = torch._utils._flatten_dense_tensors(trainable_parameters)
-            self.flat_param_groups.append(flatten_param_group)
-            for param in trainable_parameters:
-                param.data = torch.empty(1,device=param.device)
-            self.update_parameter(group_idx=i)
-            ## update param_group["params"] using sharding one
-            num_per_gpu = flatten_param_group.numel() // self.world_size
-            param_group["params"] = [flatten_param_group[num_per_gpu*self.rank:num_per_gpu*(self.rank+1)].clone().detach().requires_grad_()]
-            
-        
+
         super().__init__(params, self.base_optimizer.defaults)
     
     def update_parameter(self, group_idx):
