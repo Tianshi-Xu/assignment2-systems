@@ -1,1 +1,1 @@
-uv run nsys profile --force-overwrite true --python-backtrace=cuda -o result_1 python cs336_systems/ddp.py
+uv run nsys profile --force-overwrite true --python-backtrace=cuda -o result python cs336_systems/flash_att.py
