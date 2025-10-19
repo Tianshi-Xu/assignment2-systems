@@ -100,33 +100,32 @@ def naive_scaled_dot_product_attention(
 
 @triton.autotune(
     configs=[
-        triton.Config({'Q_TILE_SIZE': 16, "K_TILE_SIZE": 16}, num_warps=4),
-        triton.Config({'Q_TILE_SIZE': 32, "K_TILE_SIZE": 32}, num_warps=4),
-        triton.Config({'Q_TILE_SIZE': 64, "K_TILE_SIZE": 64}, num_warps=4, num_stages=3),
-        triton.Config({'Q_TILE_SIZE': 64, "K_TILE_SIZE": 64}, num_warps=4, num_stages=4),
-        triton.Config({'Q_TILE_SIZE': 128, "K_TILE_SIZE": 128}, num_warps=4),
-        triton.Config({'Q_TILE_SIZE': 16, "K_TILE_SIZE": 16}, num_warps=8),
-        triton.Config({'Q_TILE_SIZE': 32, "K_TILE_SIZE": 32}, num_warps=8),
-        triton.Config({'Q_TILE_SIZE': 64, "K_TILE_SIZE": 64}, num_warps=8),
-        triton.Config({'Q_TILE_SIZE': 128, "K_TILE_SIZE": 32}, num_warps=8),
-        triton.Config({'Q_TILE_SIZE': 128, "K_TILE_SIZE": 64}, num_warps=8),
-        triton.Config({'Q_TILE_SIZE': 128, "K_TILE_SIZE": 128}, num_warps=8),
-        triton.Config({'Q_TILE_SIZE': 256, "K_TILE_SIZE": 256}, num_warps=8),
-        triton.Config({'Q_TILE_SIZE': 128, "K_TILE_SIZE": 64}, num_warps=16),
-        triton.Config({'Q_TILE_SIZE': 128, "K_TILE_SIZE": 128}, num_warps=16),
+        triton.Config({'Q_TILE_SIZE': 16}, num_warps=4),
+        triton.Config({'Q_TILE_SIZE': 32}, num_warps=4),
+        triton.Config({'Q_TILE_SIZE': 64}, num_warps=2),
+        triton.Config({'Q_TILE_SIZE': 64}, num_warps=4),
+        triton.Config({'Q_TILE_SIZE': 64}, num_warps=4, num_stages=3),
+        triton.Config({'Q_TILE_SIZE': 64}, num_warps=4, num_stages=4),
+        triton.Config({'Q_TILE_SIZE': 128}, num_warps=4),
+        triton.Config({'Q_TILE_SIZE': 16}, num_warps=8),
+        triton.Config({'Q_TILE_SIZE': 32}, num_warps=8),
+        triton.Config({'Q_TILE_SIZE': 64}, num_warps=8),
+        triton.Config({'Q_TILE_SIZE': 128}, num_warps=8),
     ],
     key=['D', 'N_QUERIES', 'N_KEYS'],   # 🔑 关键参数
 )
 @triton.heuristics(
     {
         'Q_TILE_SIZE': lambda args: min(args['Q_TILE_SIZE'], args['N_QUERIES']),
+        'K_TILE_SIZE': lambda args: min(args['Q_TILE_SIZE'], args['N_KEYS']),
     }
 )
+### grid should be (T_q,, batch_size), use autotune
 @triton.jit
 def flash_fwd_kernel(
     Q_ptr, K_ptr, V_ptr,
     O_ptr, L_ptr,
-    stride_qb, stride_qq, stride_qd,
+    stride_qb, stride_qq, stride_qd,  ### stride for batch, sqlen, d
     stride_kb, stride_kk, stride_kd,
     stride_vb, stride_vk, stride_vd,
     stride_ob, stride_oq, stride_od,
@@ -138,92 +137,80 @@ def flash_fwd_kernel(
     K_TILE_SIZE: tl.constexpr,
     is_causal: tl.constexpr,
     INPUT_DTYPE: tl.constexpr,
-    NUM_SMS: tl.constexpr,
-    NUM_BATCHES: tl.constexpr,
 ):
-    start_pid = tl.program_id(0)
-    
-    num_q_tiles = tl.cdiv(N_QUERIES, Q_TILE_SIZE)
-    num_total_tiles = num_q_tiles * NUM_BATCHES
-    # 创建当前 tile 的 block pointers
-    Q_block_ptr = tl.make_block_ptr(
-        Q_ptr,
+    # Program indices
+    query_tile_index = tl.program_id(0)
+    batch_index = tl.program_id(1)
+
+    # Offset each pointer with the corresponding batch index
+    # multiplied with the batch stride for each tensor
+    Q_desc = tl.make_tensor_descriptor(
+        Q_ptr + batch_index * stride_qb,
         shape=(N_QUERIES, D),
         strides=(stride_qq, stride_qd),
-        offsets=(start_pid * Q_TILE_SIZE, 0),
+        # offsets=(query_tile_index * Q_TILE_SIZE, 0),
         block_shape=(Q_TILE_SIZE, D),
-        order=(1, 0),
-    )
-    O_block_ptr = tl.make_block_ptr(
-        O_ptr,
-        shape=(N_QUERIES, D),
-        strides=(stride_oq, stride_od),
-        offsets=(start_pid * Q_TILE_SIZE, 0),
-        block_shape=(Q_TILE_SIZE, D),
-        order=(1, 0),
-    )
-    L_block_ptr = tl.make_block_ptr(
-        L_ptr,
-        shape=(N_QUERIES,),
-        strides=(stride_lq,),
-        offsets=(start_pid * Q_TILE_SIZE,),
-        block_shape=(Q_TILE_SIZE,),
-        order=(0,),
+        # order=(1, 0),
     )
     K_desc = tl.make_tensor_descriptor(
-        K_ptr,
-        shape=(NUM_BATCHES, N_KEYS, D),
-        strides=(stride_kb, stride_kk, stride_kd),
+        K_ptr + batch_index * stride_kb,
+        shape=(N_KEYS, D),
+        strides=(stride_kk, stride_kd),
         # offsets=(0, 0),
-        block_shape=(1, K_TILE_SIZE, D),
+        block_shape=(K_TILE_SIZE, D),
         # order=(1, 0),
     )
     V_desc = tl.make_tensor_descriptor(
-        V_ptr,
-        shape=(NUM_BATCHES, N_KEYS, D),
-        strides=(stride_vb, stride_vk, stride_vd),
+        V_ptr + batch_index * stride_vb,
+        shape=(N_KEYS, D),
+        strides=(stride_vk, stride_vd),
         # offsets=(0, 0),
-        block_shape=(1, K_TILE_SIZE, D),
+        block_shape=(K_TILE_SIZE, D),
         # order=(1, 0),
     )
-    # 关键修改：循环遍历所有 tiles，不仅仅是一个 batch 的
-    for tile_id in tl.range(start_pid, num_total_tiles, NUM_SMS):
-        # 从 tile_id 计算出 batch_index 和 query_tile_index
-        batch_index = tile_id // num_q_tiles
-        query_tile_index = tile_id % num_q_tiles
-        
-        # 加载 Q 并进行计算
-        Q = tl.load(Q_block_ptr, boundary_check=(0,1), padding_option="zero")
-        O_i = tl.zeros((Q_TILE_SIZE, D), dtype=tl.float32)
-        l_i = tl.zeros((Q_TILE_SIZE, 1), dtype=tl.float32)
-        m_i = tl.full((Q_TILE_SIZE, 1), -float("inf"), dtype=tl.float32)
-        new_m_i = tl.zeros((Q_TILE_SIZE, 1), dtype=tl.float32)
+    O_desc = tl.make_tensor_descriptor(
+        O_ptr + batch_index * stride_ob,
+        shape=(N_QUERIES, D),
+        strides=(stride_oq, stride_od),
+        # offsets=(query_tile_index * Q_TILE_SIZE, 0),
+        block_shape=(Q_TILE_SIZE, D),
+        # order=(1, 0),
+    )
+    L_desc = tl.make_tensor_descriptor(
+        L_ptr + batch_index * stride_lb,
+        shape=(N_QUERIES,),
+        strides=(stride_lq,),
+        # offsets=(query_tile_index * Q_TILE_SIZE,),
+        block_shape=(Q_TILE_SIZE,),
+        # order=(0,),
+    )
+    Q = Q_desc.load([query_tile_index * Q_TILE_SIZE, 0])
+    O_i = tl.zeros((Q_TILE_SIZE, D), dtype=tl.float32)
+    l_i = tl.zeros((Q_TILE_SIZE, 1), dtype=tl.float32)
+    m_i = tl.full((Q_TILE_SIZE, 1), -float("inf"), dtype=tl.float32)
+    new_m_i = tl.zeros((Q_TILE_SIZE, 1), dtype=tl.float32)
+    for i in range(tl.cdiv(N_KEYS, K_TILE_SIZE)):
+        K_i = K_desc.load([i * K_TILE_SIZE, 0])
+        V_i = V_desc.load([i * K_TILE_SIZE, 0])
+        S_i = tl.dot(Q, tl.trans(K_i), out_dtype=tl.float32)
+        S_i = S_i * scale
         if is_causal:
-            offset_q = tl.arange(0, Q_TILE_SIZE)
-            offset_q = tl.expand_dims(offset_q, 1)
-            offset_k = tl.arange(0, K_TILE_SIZE)
-            offset_k = tl.expand_dims(offset_k, 0)
-        for i in range(tl.cdiv(N_KEYS, K_TILE_SIZE)):
-            K_i = K_desc.load([batch_index, i * K_TILE_SIZE, 0]).reshape(K_TILE_SIZE,D)
-            V_i = V_desc.load([batch_index, i * K_TILE_SIZE, 0]).reshape(K_TILE_SIZE,D)
-            S_i = tl.dot(Q, tl.trans(K_i), out_dtype=tl.float32)
-            S_i = S_i * scale
-            if is_causal:
-                mask = (offset_q + query_tile_index * Q_TILE_SIZE) >= (offset_k + i * K_TILE_SIZE)
-                S_i = tl.where(mask, S_i, -float("inf"))
-            new_m_i = tl.maximum(m_i, tl.max(S_i, axis=1, keep_dims=True))
-            P_i = tl.exp(S_i - new_m_i)
-            tmp = tl.exp(m_i - new_m_i)
-            l_i = tmp * l_i + tl.sum(P_i, axis=1, keep_dims=True)
-            O_i = tmp * O_i + tl.dot(P_i.to(INPUT_DTYPE), V_i, out_dtype=tl.float32)
-            m_i = new_m_i
-        
-        O_i = O_i / l_i
-        tl.store(O_block_ptr, O_i.to(INPUT_DTYPE), boundary_check=(0,1))
-        tl.store(L_block_ptr, (m_i + tl.log(l_i)).reshape(Q_TILE_SIZE), boundary_check=(0,))
-        Q_block_ptr = Q_block_ptr.advance((Q_TILE_SIZE*NUM_SMS, 0))
-        O_block_ptr = O_block_ptr.advance((Q_TILE_SIZE*NUM_SMS, 0))
-        L_block_ptr = L_block_ptr.advance((Q_TILE_SIZE*NUM_SMS, ))
+            offset_q = tl.arange(0,Q_TILE_SIZE)
+            offset_q = tl.expand_dims(offset_q,1)
+            offset_k = tl.arange(0,K_TILE_SIZE)
+            offset_k = tl.expand_dims(offset_k,0)
+            mask = (offset_q + query_tile_index * Q_TILE_SIZE) >= (offset_k + i * K_TILE_SIZE)
+            mask = tl.where(mask, 0, -float("inf"))
+            S_i = S_i + mask 
+        new_m_i = tl.maximum(m_i, tl.max(S_i, axis=1, keep_dims=True))
+        P_i = tl.exp(S_i-new_m_i)
+        tmp = tl.exp(m_i-new_m_i)
+        l_i = tmp * l_i + tl.sum(P_i, axis=1, keep_dims=True)
+        O_i = tmp * O_i + tl.dot(P_i.to(INPUT_DTYPE), V_i, out_dtype=tl.float32)
+        m_i = new_m_i
+    O_i = O_i / l_i
+    O_desc.store([query_tile_index * Q_TILE_SIZE, 0], O_i.to(INPUT_DTYPE))
+    L_desc.store([query_tile_index * Q_TILE_SIZE,], (m_i + tl.log(l_i)).reshape(Q_TILE_SIZE))
 
 @triton.autotune(
     configs=[
@@ -361,7 +348,8 @@ def flash_bwd_kernel(
             offset_k = tl.arange(0,K_TILE_SIZE)
             offset_k = tl.expand_dims(offset_k,0)
             mask = (offset_q + i * Q_TILE_SIZE) >= (offset_k + kv_tile_index * K_TILE_SIZE)
-            S_i = tl.where(mask, S_i, -float("inf"))
+            mask = tl.where(mask, 0, -float("inf"))
+            S_i = S_i + mask
             # tl.device_print("mask", mask)
         L_i = tl.expand_dims(L_i,1)
         # tl.device_print("L_i",L_i)
@@ -525,7 +513,8 @@ def flash_bwd_kernel_fast_dKV(
             offset_k = tl.arange(0,K_TILE_SIZE)
             offset_k = tl.expand_dims(offset_k,0)
             mask = (offset_q + i * Q_TILE_SIZE) >= (offset_k + kv_tile_index * K_TILE_SIZE)
-            S_i = tl.where(mask, S_i, -float("inf"))
+            mask = tl.where(mask, 0, -float("inf"))
+            S_i = S_i + mask
             # tl.device_print("mask", mask)
         L_i = tl.expand_dims(L_i,1)
         # tl.device_print("L_i",L_i)
@@ -663,7 +652,8 @@ def flash_bwd_kernel_fast_dQ(
             offset_k = tl.arange(0,K_TILE_SIZE)
             offset_k = tl.expand_dims(offset_k,0)
             mask = (offset_q + q_tile_index * Q_TILE_SIZE) >= (offset_k + i * K_TILE_SIZE)
-            S_i = tl.where(mask, S_i, -float("inf"))
+            mask = tl.where(mask, 0, -float("inf"))
+            S_i = S_i + mask
             # tl.device_print("mask", mask)
         # tl.device_print("L_i",L_i)
         # tl.device_print("S_i-L_i",S_i-L_i)
@@ -681,8 +671,6 @@ def flash_bwd_kernel_fast_dQ(
 class FlashAttentionTriton(torch.autograd.Function):
     @staticmethod
     def forward(ctx, Q, K, V, is_causal=False):
-        if len(Q.shape) == 3:
-            Q = Q.unsqueeze(1)
         # print(Q.shape)
         batch, num_head, num_q, d = Q.shape
         num_k = K.shape[2]
@@ -694,9 +682,10 @@ class FlashAttentionTriton(torch.autograd.Function):
         Q=Q.view(-1, num_q, d)
         K=K.view(-1, num_k, d)
         V=V.view(-1, num_k, d)
-        NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count * 4
+        NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
         grid = lambda meta: (
-            min(NUM_SMS, triton.cdiv(num_q, meta['Q_TILE_SIZE']) * batch * num_head),
+            triton.cdiv(num_q, meta['Q_TILE_SIZE']),
+            batch * num_head,
         )
         input_dtype_triton = dtype_map.get(Q.dtype, tl.float32)
         O = torch.empty_like(Q, device=Q.device, dtype=Q.dtype)
@@ -714,8 +703,6 @@ class FlashAttentionTriton(torch.autograd.Function):
             D=d,
             is_causal=is_causal,
             INPUT_DTYPE=input_dtype_triton,
-            NUM_SMS=NUM_SMS,
-            NUM_BATCHES=batch * num_head,
             ### autotune, Q_TILE_SIZE and K_TILE_SIZE will be replaced by the best config
         )
         ctx.save_for_backward(Q, K, V, L, O)
@@ -857,11 +844,11 @@ def test_triton():
     pytorch_func = FlashAttentionTorch.apply
     triton_func = FlashAttentionTriton.apply
     input_type = torch.bfloat16
-    Q = torch.randn(1,1,32768,64, requires_grad=True,device="cuda", dtype=input_type)
-    K = torch.randn(1,1,32768,64, requires_grad=True,device="cuda", dtype=input_type)
-    V = torch.randn(1,1,32768,64, requires_grad=True,device="cuda", dtype=input_type)
+    Q = torch.randn(1,1,65536,128, requires_grad=True,device="cuda", dtype=input_type)
+    K = torch.randn(1,1,65536,128, requires_grad=True,device="cuda", dtype=input_type)
+    V = torch.randn(1,1,65536,128, requires_grad=True,device="cuda", dtype=input_type)
     with sdpa_kernel(backends=[SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]):
-        O_pytorch = ground_truth(Q, K, V, is_causal=False)
+        O_pytorch = ground_truth(Q, K, V, is_causal=True)
     dO = 0.1*torch.randn_like(O_pytorch, dtype=torch.float32)
     print("O_pytorch.dtype:", O_pytorch.dtype)
     print("dO.dtype:", dO.dtype)
@@ -877,16 +864,13 @@ def test_triton():
     Q = Q.detach().to(input_type).requires_grad_(True)
     K = K.detach().to(input_type).requires_grad_(True)
     V = V.detach().to(input_type).requires_grad_(True)
-    O_triton = triton_func(Q, K, V, False)
+    O_triton = triton_func(Q, K, V, True)
     O_triton.backward(dO)
     Q_grad_triton = Q.grad.clone()
     K_grad_triton = K.grad.clone()
     V_grad_triton = V.grad.clone()
     # print(flash_bwd_kernel.best_config)
     # print("V_grad_triton:",V_grad_triton)
-    print(O_pytorch.flatten()[-10:])
-    print(O_triton.flatten()[-10:])
-    print(torch.sum((O_pytorch-O_triton).abs() <= 1e-3))
     print("output max error:", torch.max(torch.abs(O_pytorch - O_triton)))
     print("Q grad max error:", torch.max(torch.abs(Q_grad_pytorch - Q_grad_triton)))
     print("K grad max error:", torch.max(torch.abs(K_grad_pytorch - K_grad_triton)))
@@ -895,7 +879,6 @@ def test_triton():
     print("Q grad max error:", torch.allclose(Q_grad_pytorch, Q_grad_triton, atol=1e-2, rtol=1e-3))
     print("K grad max error:", torch.allclose(K_grad_pytorch, K_grad_triton, atol=1e-2, rtol=1e-3))
     print("V grad max error:", torch.allclose(V_grad_pytorch, V_grad_triton, atol=1e-2, rtol=1e-3))
-    print(flash_fwd_kernel.best_config)
 
 def triton_bench(use_triton, sqlen, head_dim,num_head, mode, samples=5, warmup_steps=5):
     torch.set_float32_matmul_precision('high')
@@ -981,7 +964,7 @@ def benchmark_flash_att():
             #     triton_bench(True, sqlen, head_dim, num_head, mode)
 
 if __name__ == "__main__":
-    test_triton()
-    # benchmark_flash_att()
+    # test_triton()
+    benchmark_flash_att()
     # best_config = flash_fwd_kernel.best_config
     # print(best_config)

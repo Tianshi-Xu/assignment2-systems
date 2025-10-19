@@ -12,6 +12,7 @@ data
 *.npy
 .venv
 *.json
+*.txt
 
 # C extensions
 *.so
