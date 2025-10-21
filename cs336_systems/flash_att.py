@@ -12,7 +12,7 @@ import torch.cuda.nvtx as nvtx
 from torch.nn.functional import scaled_dot_product_attention
 from transformers.models.llama.modeling_llama import LlamaAttention
 from torch.nn.attention import sdpa_kernel
-from torch.backends.cuda import SDPBackend
+from torch.backends.cuda import SDPBackend  
 
 class FlashAttentionTorch(torch.autograd.Function):
     @staticmethod
