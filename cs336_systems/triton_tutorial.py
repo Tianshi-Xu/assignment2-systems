@@ -4,6 +4,7 @@ import os
 
 import triton
 import triton.language as tl
+import math
 from triton.tools.tensor_descriptor import TensorDescriptor
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
@@ -44,7 +45,7 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
         lo = tl.multiple_of(lo, BLOCK_M)
     # causal = False
     else:
-        lo, hi = 0, N_CTX
+        lo, hi = 0, N_CTX  # for sequence length
     offsetk_y = offset_y + lo
     if dtype == tl.float8e5:
         offsetv_y = offset_y * HEAD_DIM + lo
@@ -52,7 +53,7 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
         offsetv_y = offset_y + lo
     # loop over k, v and update accumulator
     for start_n in tl.range(lo, hi, BLOCK_N, warp_specialize=warp_specialize):
-        start_n = tl.multiple_of(start_n, BLOCK_N)
+        start_n = tl.multiple_of(start_n, BLOCK_N)  # 告诉编译器start_n是BLOCK_N的倍数，可以生成更优化的代码
         # -- compute qk ----
         k = desc_k.load([offsetk_y, 0]).T
         qk = tl.dot(q, k)
@@ -62,7 +63,7 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
             m_ij = tl.maximum(m_i, tl.max(qk, 1))
             qk -= m_ij[:, None]
         else:
-            m_ij = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)
+            m_ij = tl.maximum(m_i, tl.max(qk, 1) * qk_scale) # m_i: (BLOCK_M,)
             qk = qk * qk_scale - m_ij[:, None]
         p = tl.math.exp2(qk)
         # -- compute correction factor
@@ -168,8 +169,8 @@ def _attn_fwd(sm_scale, M,  #
               ):
     dtype = tl.float8e5 if FP8_OUTPUT else tl.float16
     tl.static_assert(BLOCK_N <= HEAD_DIM)
-    start_m = tl.program_id(0)
-    off_hz = tl.program_id(1)
+    start_m = tl.program_id(0) # for sqlen
+    off_hz = tl.program_id(1) # for batch * num_head
     off_z = off_hz // H  
     off_h = off_hz % H
 
@@ -478,15 +479,16 @@ def _attn_bwd(Q, K, V, sm_scale,  #
 class _attention(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx, q, k, v, causal, sm_scale, warp_specialize=True):
+    def forward(ctx, q, k, v, is_causal, warp_specialize=True):
         # shape constraints
         HEAD_DIM_Q, HEAD_DIM_K = q.shape[-1], k.shape[-1]
+        sm_scale = 1/math.sqrt(HEAD_DIM_K)
         # when v is in float8_e5m2 it is transposed.
         HEAD_DIM_V = v.shape[-1]
         assert HEAD_DIM_Q == HEAD_DIM_K and HEAD_DIM_K == HEAD_DIM_V
         assert HEAD_DIM_K in {16, 32, 64, 128, 256}
         o = torch.empty_like(q)
-        stage = 3 if causal else 1
+        stage = 3 if is_causal else 1
         extra_kern_args = {}
         # Tuning for AMD target
         if is_hip():
@@ -544,7 +546,7 @@ class _attention(torch.autograd.Function):
         ctx.save_for_backward(q, k, v, o, M)
         ctx.sm_scale = sm_scale
         ctx.HEAD_DIM = HEAD_DIM_K
-        ctx.causal = causal
+        ctx.causal = is_causal
         return o
 
     @staticmethod
