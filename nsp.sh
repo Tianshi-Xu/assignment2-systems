@@ -1,1 +1,1 @@
-CUDA_VISIBLE_DEVICES=2 uv run nsys profile --force-overwrite true --python-backtrace=cuda -o result_torch python cs336_systems/flash_att.py
+CUDA_VISIBLE_DEVICES=2 uv run nsys profile --force-overwrite true --python-backtrace=cuda -o result_leaderboard python cs336_systems/flash_att.py
