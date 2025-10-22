@@ -12,7 +12,8 @@ import torch.cuda.nvtx as nvtx
 from torch.nn.functional import scaled_dot_product_attention
 from transformers.models.llama.modeling_llama import LlamaAttention
 from torch.nn.attention import sdpa_kernel
-from torch.backends.cuda import SDPBackend
+from torch.backends.cuda import SDPBackend  
+from triton_tutorial import _attention
 
 class FlashAttentionTorch(torch.autograd.Function):
     @staticmethod
@@ -237,7 +238,7 @@ def flash_fwd_kernel(
 )
 
 @triton.jit
-def flash_bwd_kernel(
+def flash_bwd_kernel_slow(
     Q_ptr, K_ptr, V_ptr,
     L_ptr, D_ptr,
     dO_ptr, dQ_ptr, dK_ptr, dV_ptr,
@@ -385,30 +386,6 @@ def flash_bwd_kernel(
     tl.store(dK_block_ptr, dK)
     tl.store(dV_block_ptr, dV)
 
-
-@triton.autotune(
-    configs=[
-        triton.Config({'Q_TILE_SIZE': 16}, num_warps=4),
-        triton.Config({'Q_TILE_SIZE': 16}, num_warps=8),
-        triton.Config({'Q_TILE_SIZE': 32}, num_warps=8),
-        triton.Config({'Q_TILE_SIZE': 64}, num_warps=8),
-        triton.Config({'Q_TILE_SIZE': 128}, num_warps=8),
-        triton.Config({'Q_TILE_SIZE': 128}, num_warps=8, num_stages=3),
-        triton.Config({'Q_TILE_SIZE': 256}, num_warps=8),
-        triton.Config({'Q_TILE_SIZE': 32}, num_warps=16),
-        triton.Config({'Q_TILE_SIZE': 64}, num_warps=16),
-        triton.Config({'Q_TILE_SIZE': 128}, num_warps=16),
-        triton.Config({'Q_TILE_SIZE': 256}, num_warps=16),
-    ],
-    key=['d', 'N_QUERIES', 'N_KEYS'],   # 🔑 关键参数
-)
-
-@triton.heuristics(
-    {
-        'Q_TILE_SIZE': lambda args: min(args['Q_TILE_SIZE'], args['N_QUERIES']),
-        'K_TILE_SIZE': lambda args: min(args['Q_TILE_SIZE'], args['N_KEYS']),
-    }
-)
 @triton.jit
 def flash_bwd_kernel_fast_dKV(
     Q_ptr, K_ptr, V_ptr,
@@ -534,28 +511,6 @@ def flash_bwd_kernel_fast_dKV(
     tl.store(dV_block_ptr, dV)
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({'Q_TILE_SIZE': 16}, num_warps=4),
-        triton.Config({'Q_TILE_SIZE': 16}, num_warps=8),
-        triton.Config({'Q_TILE_SIZE': 32}, num_warps=8),
-        triton.Config({'Q_TILE_SIZE': 64}, num_warps=8),
-        triton.Config({'Q_TILE_SIZE': 128}, num_warps=8),
-        triton.Config({'Q_TILE_SIZE': 256}, num_warps=8),
-        triton.Config({'Q_TILE_SIZE': 32}, num_warps=16),
-        triton.Config({'Q_TILE_SIZE': 64}, num_warps=16),
-        triton.Config({'Q_TILE_SIZE': 128}, num_warps=16),
-        triton.Config({'Q_TILE_SIZE': 256}, num_warps=16),
-    ],
-    key=['d', 'N_QUERIES', 'N_KEYS'],   # 🔑 关键参数
-)
-
-@triton.heuristics(
-    {
-        'Q_TILE_SIZE': lambda args: min(args['Q_TILE_SIZE'], args['N_QUERIES']),
-        'K_TILE_SIZE': lambda args: min(args['Q_TILE_SIZE'], args['N_KEYS']),
-    }
-)
 @triton.jit
 def flash_bwd_kernel_fast_dQ(
     Q_ptr, K_ptr, V_ptr,
@@ -667,6 +622,90 @@ def flash_bwd_kernel_fast_dQ(
         V_block_ptr = V_block_ptr.advance((K_TILE_SIZE, 0))
     tl.store(dQ_block_ptr, dQ)
 
+
+@triton.autotune(
+    configs=[
+        triton.Config({'Q_TILE_SIZE': 16, 'K_TILE_SIZE': 16}, num_warps=4),
+        triton.Config({'Q_TILE_SIZE': 16, 'K_TILE_SIZE': 16}, num_warps=8),
+        triton.Config({'Q_TILE_SIZE': 32, 'K_TILE_SIZE': 32}, num_warps=8),
+        triton.Config({'Q_TILE_SIZE': 64, 'K_TILE_SIZE': 64}, num_warps=8),
+        triton.Config({'Q_TILE_SIZE': 128, 'K_TILE_SIZE': 128}, num_warps=8),
+        triton.Config({'Q_TILE_SIZE': 256, 'K_TILE_SIZE': 256}, num_warps=8),
+        triton.Config({'Q_TILE_SIZE': 32, 'K_TILE_SIZE': 32}, num_warps=16),
+        triton.Config({'Q_TILE_SIZE': 64, 'K_TILE_SIZE': 64}, num_warps=16),
+        triton.Config({'Q_TILE_SIZE': 128, 'K_TILE_SIZE': 128}, num_warps=16),
+    ],
+    key=['d', 'N_QUERIES', 'N_KEYS'],   # 🔑 关键参数
+)
+
+@triton.heuristics(
+    {
+        'Q_TILE_SIZE': lambda args: min(args['Q_TILE_SIZE'], args['N_QUERIES']),
+        'K_TILE_SIZE': lambda args: min(args['K_TILE_SIZE'], args['N_KEYS']),
+    }
+)
+@triton.jit
+def flash_bwd_kernel(
+    Q_ptr, K_ptr, V_ptr,
+    L_ptr, D_ptr,
+    dO_ptr, dQ_ptr, dK_ptr, dV_ptr,
+    stride_qb, stride_qq, stride_qd,  ### stride for batch, sqlen, d
+    stride_kb, stride_kk, stride_kd,
+    stride_vb, stride_vv, stride_vd,
+    stride_ob, stride_oo, stride_od,
+    stride_lb, stride_ll,
+    stride_Db, stride_DD,
+    N_BATCHES: tl.constexpr,
+    N_QUERIES: tl.constexpr, N_KEYS: tl.constexpr,
+    scale: tl.constexpr,
+    d: tl.constexpr,
+    Q_TILE_SIZE: tl.constexpr,
+    K_TILE_SIZE: tl.constexpr,
+    is_causal: tl.constexpr,
+    INPUT_DTYPE: tl.constexpr,
+):
+    grid_dkv = lambda meta: (
+        triton.cdiv(N_KEYS, K_TILE_SIZE),
+        N_BATCHES,
+    )
+    grid_dq = lambda meta: (
+        triton.cdiv(N_QUERIES, Q_TILE_SIZE),
+        N_BATCHES,
+    )
+    flash_bwd_kernel_fast_dKV[grid_dkv](
+        Q_ptr, K_ptr, V_ptr,
+        L_ptr, D_ptr,
+        dO_ptr, dK_ptr, dV_ptr,
+        stride_qb, stride_qq, stride_qd,
+        stride_kb, stride_kk, stride_kd,
+        stride_vb, stride_vv, stride_vd,
+        stride_ob, stride_oo, stride_od,
+        stride_lb, stride_ll,
+        stride_Db, stride_DD,
+        N_QUERIES, N_KEYS,
+        scale,
+        d,
+        is_causal,
+        INPUT_DTYPE,
+    )
+    flash_bwd_kernel_fast_dQ[grid_dq](
+        Q_ptr, K_ptr, V_ptr,
+        L_ptr, D_ptr,
+        dO_ptr, dQ_ptr,
+        stride_qb, stride_qq, stride_qd,
+        stride_kb, stride_kk, stride_kd,
+        stride_vb, stride_vv, stride_vd,
+        stride_ob, stride_oo, stride_od,
+        stride_lb, stride_ll,
+        stride_Db, stride_DD,
+        N_QUERIES, N_KEYS,
+        scale,
+        d,
+        is_causal,
+        INPUT_DTYPE,
+    )
+    return
+
 class FlashAttentionTriton(torch.autograd.Function):
     @staticmethod
     def forward(ctx, Q, K, V, is_causal=False):
@@ -768,9 +807,14 @@ class FlashAttentionTriton(torch.autograd.Function):
         grad_out = grad_out.to(torch.float32)
         Q,K,V,L,O = ctx.saved_tensors
         is_causal = ctx.is_causal
-        batch, n_queries, d = Q.shape
+        batch, n_head, n_queries, d = Q.shape
         n_keys = K.shape[-2]
-        grid_dkv = lambda meta: (
+        dtype_map = {
+            torch.float32: tl.float32,
+            torch.float16: tl.float16,
+            torch.bfloat16: tl.bfloat16,
+        }
+        grid = lambda meta: (
             triton.cdiv(n_keys, meta['K_TILE_SIZE']),
             batch,
         )
@@ -778,56 +822,12 @@ class FlashAttentionTriton(torch.autograd.Function):
             triton.cdiv(n_queries, meta['Q_TILE_SIZE']),
             batch,
         )
-        dtype_map = {
-            torch.float32: tl.float32,
-            torch.float16: tl.float16,
-            torch.bfloat16: tl.bfloat16,
-        }
         input_dtype_triton = dtype_map.get(Q.dtype, tl.float32)
-        O = O.view(-1,n_queries,d)
-        grad_out = grad_out.view(-1,n_queries,d)
         D = reduce(O.float() * grad_out, "... N_q d -> ... N_q", "sum")
         dQ = torch.empty_like(Q, device=Q.device, dtype=torch.float32)
         dK = torch.empty_like(K, device=K.device, dtype=torch.float32)
         dV = torch.empty_like(V, device=V.device, dtype=torch.float32)
-        stream_q = torch.cuda.Stream()
-        stream_kv = torch.cuda.Stream()
-        with torch.cuda.stream(stream_kv):
-            flash_bwd_kernel_fast_dKV[grid_dkv](
-                Q,K,V,
-                L,D,
-                grad_out,dK,dV,
-                Q.stride(0), Q.stride(1), Q.stride(2),
-                K.stride(0), K.stride(1), K.stride(2),
-                V.stride(0), V.stride(1), V.stride(2),
-                grad_out.stride(0), grad_out.stride(1), grad_out.stride(2),
-                L.stride(0),L.stride(1),
-                D.stride(0),D.stride(1),
-                n_queries, n_keys,
-                scale=1/math.sqrt(d),
-                d=d,
-                is_causal=is_causal,
-                INPUT_DTYPE=input_dtype_triton,
-            )
-        with torch.cuda.stream(stream_q):
-            flash_bwd_kernel_fast_dQ[grid_dq](
-                Q,K,V,
-                L,D,
-                grad_out,dQ,
-                Q.stride(0), Q.stride(1), Q.stride(2),
-                K.stride(0), K.stride(1), K.stride(2),
-                V.stride(0), V.stride(1), V.stride(2),
-                grad_out.stride(0), grad_out.stride(1), grad_out.stride(2),
-                L.stride(0),L.stride(1),
-                D.stride(0),D.stride(1),
-                n_queries, n_keys,
-                scale=1/math.sqrt(d),
-                d=d,
-                is_causal=is_causal,
-                INPUT_DTYPE=input_dtype_triton,
-            )
-        stream_kv.synchronize()
-        stream_q.synchronize()
+        flash_bwd_kernel
         dQ = dQ.view(-1, ctx.num_head, n_queries, d)
         dK = dK.view(-1, ctx.num_head, n_keys, d)
         dV = dV.view(-1, ctx.num_head, n_keys, d)
@@ -909,17 +909,18 @@ def triton_bench(use_triton, sqlen, head_dim,num_head, mode, samples=5, warmup_s
 
 def warmup_nvtx(sqlen, head_dim, num_head):
     torch.set_float32_matmul_precision('high')
-    input_type = torch.bfloat16
+    input_type = torch.float16
     Q  = torch.randn(1,num_head, sqlen,head_dim,requires_grad=True, device="cuda", dtype=input_type)
     K  = torch.randn(1,num_head, sqlen,head_dim,requires_grad=True, device="cuda", dtype=input_type)
     V  = torch.randn(1,num_head, sqlen,head_dim,requires_grad=True, device="cuda", dtype=input_type)
     dy = 0.1*torch.randn_like(Q, dtype=torch.float32)
     attention_mask = None
     def fwd():
-        # return FlashAttentionTriton.apply(Q,K,V,True)
+        # return FlashAttentionTriton.apply(Q,K,V,False)
+        return _attention.apply(Q,K,V,False,1/math.sqrt(head_dim))
         # with sdpa_kernel(backends=[SDPBackend.EFFICIENT_ATTENTION]):
         #     print("here")
-        return scaled_dot_product_attention(Q,K,V)
+        # return scaled_dot_product_attention(Q,K,V)
     y = fwd()
     for i in range(5):
         y.backward(dy, retain_graph=True)
@@ -930,7 +931,7 @@ def warmup_nvtx(sqlen, head_dim, num_head):
     torch.cuda.synchronize()
     # torch.cuda.memory._record_memory_history(max_entries=1000000)
     with nvtx.range("backward"):
-        for i in range(10):
+        for i in range(5):
             y.backward(dy, retain_graph=True)
             torch.cuda.synchronize()
             Q.grad.zero_()
@@ -960,7 +961,7 @@ def benchmark_flash_att():
             #     triton_bench(True, sqlen, head_dim, num_head, mode)
 
 if __name__ == "__main__":
-    test_triton()
-    # benchmark_flash_att()
+    # test_triton()
+    benchmark_flash_att()
     # best_config = flash_fwd_kernel.best_config
     # print(best_config)
