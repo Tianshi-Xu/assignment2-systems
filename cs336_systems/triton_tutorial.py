@@ -353,7 +353,7 @@ def _attn_bwd(Q, K, V, sm_scale,  #
               M, D,
               # shared by Q/K/V/DO.
               stride_z, stride_h, stride_tok, stride_d,  #
-              H, N_CTX,  #
+              NUM_HEAD, N_CTX,  #
               BLOCK_M1: tl.constexpr,  #
               BLOCK_N1: tl.constexpr,  #
               BLOCK_M2: tl.constexpr,  #
@@ -364,7 +364,7 @@ def _attn_bwd(Q, K, V, sm_scale,  #
 
     bhid = tl.program_id(2)
     off_chz = (bhid * N_CTX).to(tl.int64)
-    adj = (stride_h * (bhid % H) + stride_z * (bhid // H)).to(tl.int64)
+    adj = (stride_h * (bhid % NUM_HEAD) + stride_z * (bhid // NUM_HEAD)).to(tl.int64)
     pid = tl.program_id(0)
 
     # offset pointers for batch/head
@@ -401,7 +401,7 @@ def _attn_bwd(Q, K, V, sm_scale,  #
                             DO,  #
                             M, D,  #
                             stride_tok, stride_d,  #
-                            H, N_CTX,  #
+                            NUM_HEAD, N_CTX,  #
                             MASK_BLOCK_M1, BLOCK_N1, HEAD_DIM,  #
                             start_n, start_m, num_steps,  #
                             MASK=True  #
@@ -417,7 +417,7 @@ def _attn_bwd(Q, K, V, sm_scale,  #
         DO,  #
         M, D,  #
         stride_tok, stride_d,  #
-        H, N_CTX,  #
+        NUM_HEAD, N_CTX,  #
         BLOCK_M1, BLOCK_N1, HEAD_DIM,  #
         start_n, start_m, num_steps,  #
         MASK=False  #
@@ -454,7 +454,7 @@ def _attn_bwd(Q, K, V, sm_scale,  #
     dq = _attn_bwd_dq(dq, q, K, V,  #
                       do, m, D,  #
                       stride_tok, stride_d,  #
-                      H, N_CTX,  #
+                      NUM_HEAD, N_CTX,  #
                       BLOCK_M2, MASK_BLOCK_N2, HEAD_DIM,  #
                       start_m, end_n - num_steps * MASK_BLOCK_N2, num_steps,  #
                       MASK=True  #
@@ -465,7 +465,7 @@ def _attn_bwd(Q, K, V, sm_scale,  #
     dq = _attn_bwd_dq(dq, q, K, V,  #
                       do, m, D,  #
                       stride_tok, stride_d,  #
-                      H, N_CTX,  #
+                      NUM_HEAD, N_CTX,  #
                       BLOCK_M2, BLOCK_N2, HEAD_DIM,  #
                       start_m, end_n - num_steps * BLOCK_N2, num_steps,  #
                       MASK=False  #
@@ -575,10 +575,10 @@ class _attention(torch.autograd.Function):
             BATCH, N_HEAD, N_CTX,  #
             BLOCK_M=PRE_BLOCK, HEAD_DIM=ctx.HEAD_DIM  #
         )
-        grid = (N_CTX // BLOCK_N1, 1, BATCH * N_HEAD)
+        grid = (N_CTX // BLOCK_N1, 1, BATCH * N_HEAD)  # sqlen, batch
         _attn_bwd[grid](
             q, arg_k, v, ctx.sm_scale, do, dq, dk, dv,  #
-            M, delta,  #
+            M, delta,  # M is Denominator, delta is rowsum(O * dO)
             q.stride(0), q.stride(1), q.stride(2), q.stride(3),  #
             N_HEAD, N_CTX,  #
             BLOCK_M1=BLOCK_M1, BLOCK_N1=BLOCK_N1,  #
