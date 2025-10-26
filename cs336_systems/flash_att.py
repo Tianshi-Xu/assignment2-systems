@@ -388,15 +388,14 @@ def flash_bwd_kernel_slow(
 
 @triton.jit
 def flash_bwd_kernel_fast_dKV(
-    Q_ptr, K_ptr, V_ptr,
+    Q_ptr, K, V,
     L_ptr, D_ptr,
-    dO_ptr, dK_ptr, dV_ptr,
+    dO_ptr, dK, dV,
     stride_qb, stride_qq, stride_qd,  ### stride for batch, sqlen, d
-    stride_kb, stride_kk, stride_kd,
-    stride_vb, stride_vv, stride_vd,
     stride_ob, stride_oo, stride_od,
     stride_lb, stride_ll,
     stride_Db, stride_DD,
+    STAGE: tl.constexpr,  ### 1
     N_QUERIES: tl.constexpr, N_KEYS: tl.constexpr,
     scale: tl.constexpr,
     d: tl.constexpr,
@@ -405,25 +404,8 @@ def flash_bwd_kernel_fast_dKV(
     is_causal: tl.constexpr,
     INPUT_DTYPE: tl.constexpr,
 ):
-        # Program indices
     kv_tile_index = tl.program_id(0)
     batch_index = tl.program_id(1)
-    K_block_ptr = tl.make_block_ptr(
-        K_ptr + batch_index * stride_kb,
-        shape=(N_KEYS, d),
-        strides=(stride_kk, stride_kd),
-        offsets=(kv_tile_index * K_TILE_SIZE, 0),
-        block_shape=(K_TILE_SIZE, d),
-        order=(1, 0),
-    )
-    V_block_ptr = tl.make_block_ptr(
-        V_ptr + batch_index * stride_vb,
-        shape=(N_KEYS, d),
-        strides=(stride_vv, stride_vd),
-        offsets=(kv_tile_index * K_TILE_SIZE, 0),
-        block_shape=(K_TILE_SIZE, d),
-        order=(1, 0),
-    )
     Q_block_ptr = tl.make_block_ptr(
         Q_ptr + batch_index * stride_qb,
         shape=(N_QUERIES, d),
@@ -448,22 +430,6 @@ def flash_bwd_kernel_fast_dKV(
         block_shape=(Q_TILE_SIZE, d),
         order=(1,0)
     )
-    dK_block_ptr = tl.make_block_ptr(
-        dK_ptr + batch_index * stride_kb,
-        shape=(N_KEYS, d),
-        strides=(stride_kk, stride_kd),
-        offsets=(kv_tile_index * K_TILE_SIZE,0),
-        block_shape=(K_TILE_SIZE, d),
-        order=(1,0)
-    )
-    dV_block_ptr = tl.make_block_ptr(
-        dV_ptr + batch_index * stride_vb,
-        shape=(N_KEYS, d),
-        strides=(stride_vv, stride_vd),
-        offsets=(kv_tile_index * K_TILE_SIZE,0),
-        block_shape=(K_TILE_SIZE, d),
-        order=(1,0)
-    )
     D_block_ptr = tl.make_block_ptr(
         D_ptr + batch_index * stride_Db,
         shape=(N_QUERIES, ),
@@ -472,8 +438,6 @@ def flash_bwd_kernel_fast_dKV(
         block_shape=(Q_TILE_SIZE, ),
         order=(0,)
     )
-    K = tl.load(K_block_ptr, boundary_check=(0,1), padding_option="zero")
-    V = tl.load(V_block_ptr, boundary_check=(0,1), padding_option="zero")
     dK = tl.zeros((K_TILE_SIZE, d), dtype=tl.float32)
     dV = tl.zeros((K_TILE_SIZE, d), dtype=tl.float32)
     for i in range(tl.cdiv(N_QUERIES, Q_TILE_SIZE)):
@@ -507,8 +471,7 @@ def flash_bwd_kernel_fast_dKV(
         D_block_ptr = D_block_ptr.advance((Q_TILE_SIZE, ))
         dO_block_ptr = dO_block_ptr.advance((Q_TILE_SIZE, 0))
         L_block_ptr = L_block_ptr.advance((Q_TILE_SIZE, ))
-    tl.store(dK_block_ptr, dK)
-    tl.store(dV_block_ptr, dV)
+    return dK, dV
 
 
 @triton.jit

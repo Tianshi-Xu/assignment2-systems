@@ -39,13 +39,13 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
                     N_CTX: tl.constexpr, warp_specialize: tl.constexpr, IS_HOPPER: tl.constexpr):
     # range of values handled by this stage
     if STAGE == 1:
-        lo, hi = 0, start_m * BLOCK_M
+        lo, hi = 0, start_m * BLOCK_M  # casual=True，对角线之前的KV tile
     elif STAGE == 2:
-        lo, hi = start_m * BLOCK_M, (start_m + 1) * BLOCK_M
+        lo, hi = start_m * BLOCK_M, (start_m + 1) * BLOCK_M # casual=True，对角线，只有一个tile
         lo = tl.multiple_of(lo, BLOCK_M)
     # causal = False
     else:
-        lo, hi = 0, N_CTX  # for sequence length
+        lo, hi = 0, N_CTX  # 非casual的情况，所有KV tile都要计算
     offsetk_y = offset_y + lo
     if dtype == tl.float8e5:
         offsetv_y = offset_y * HEAD_DIM + lo
@@ -57,12 +57,12 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
         # -- compute qk ----
         k = desc_k.load([offsetk_y, 0]).T
         qk = tl.dot(q, k)
-        if STAGE == 2:
+        if STAGE == 2: # 只有stage 2需要casual mask
             mask = offs_m[:, None] >= (start_n + offs_n[None, :])
             qk = qk * qk_scale + tl.where(mask, 0, -1.0e6)
             m_ij = tl.maximum(m_i, tl.max(qk, 1))
             qk -= m_ij[:, None]
-        else:
+        else: # 肯定全取，不用mask
             m_ij = tl.maximum(m_i, tl.max(qk, 1) * qk_scale) # m_i: (BLOCK_M,)
             qk = qk * qk_scale - m_ij[:, None]
         p = tl.math.exp2(qk)

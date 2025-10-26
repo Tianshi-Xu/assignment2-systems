@@ -23,7 +23,7 @@ def test_timing_flash_forward_backward():
     def flash_forward_backward():
         # print("q.shape",q.shape)
         # o = flash(q, k, v, False, 1/math.sqrt(d_head))
-        o = flash(q, k, v, False)
+        o = flash(q, k, v, True)
         # do = torch.randn_like(o, dtype=torch.float32, device='cuda')
         # o.backward(do)
         # print(o)
