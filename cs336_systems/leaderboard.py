@@ -12,8 +12,14 @@ def test_timing_flash_forward_backward():
     n_heads = 16
     d_head = 64
     sequence_length = 16384
-    q, k, v = torch.randn(
-        3,1, n_heads, sequence_length, d_head, device='cuda', dtype=torch.float16, requires_grad=True
+    q = torch.randn(
+        1, n_heads, sequence_length, d_head, device='cuda', dtype=torch.float16, requires_grad=True
+    )
+    k = torch.randn(
+        1, n_heads, sequence_length, d_head, device='cuda', dtype=torch.float16, requires_grad=True
+    )
+    v = torch.randn(
+        1, n_heads, sequence_length, d_head, device='cuda', dtype=torch.float16, requires_grad=True
     )
 
     # flash = torch.compile(FlashAttentionTriton.apply)
@@ -22,10 +28,10 @@ def test_timing_flash_forward_backward():
 
     def flash_forward_backward():
         # print("q.shape",q.shape)
-        o = flash(q, k, v, None, 0, True)
-        # o = flash(q, k, v, True)
-        # do = torch.randn_like(o, dtype=torch.float32, device='cuda')
-        # o.backward(do)
+        o = flash(q, k, v, None, 0, False)
+        # o = flash(q, k, v, False)
+        do = torch.randn_like(o, dtype=torch.float32, device='cuda')
+        o.backward(do)
         # print(o)
         # return o
     results = triton.testing.do_bench(flash_forward_backward, rep=10000, warmup=1000)

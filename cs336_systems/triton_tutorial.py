@@ -381,7 +381,7 @@ def _attn_bwd(Q, K, V, sm_scale,  #
     # load scales
     offs_k = tl.arange(0, HEAD_DIM)
 
-    start_n = pid * BLOCK_N1
+    start_n = pid * BLOCK_N1  ### start_n 与 start_m 之前的tile是无需计算的
     start_m = start_n
 
     MASK_BLOCK_M1: tl.constexpr = BLOCK_M1 // BLK_SLICE_FACTOR
@@ -395,7 +395,7 @@ def _attn_bwd(Q, K, V, sm_scale,  #
     v = tl.load(V + offs_n[:, None] * stride_tok + offs_k[None, :] * stride_d)
 
     num_steps = BLOCK_N1 // MASK_BLOCK_M1
-
+    ## on-band
     dk, dv = _attn_bwd_dkdv(dk, dv,  #
                             Q, k, v, sm_scale,  #
                             DO,  #
